@@ -1,0 +1,331 @@
+# ============================================
+# 多重插补 + 3 次 subdivision + 多模型评估 + pooling（含 95% CI）
+# 保存 y_val & prob & model，用于 ROC, PR, Confusion Matrix, DCA, Calibration, FI
+# ============================================
+
+!pip install catboost -q
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, RepeatedStratifiedKFold, RandomizedSearchCV
+from sklearn.linear_model import LogisticRegression, LassoCV
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from catboost import CatBoostClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, roc_curve,
+    precision_score, recall_score, f1_score, average_precision_score,
+    confusion_matrix
+)
+from imblearn.over_sampling import SMOTE
+
+# 多重插补
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+
+from google.colab import files
+
+# ========== 1. 读取原始数据 ==========
+uploaded = files.upload()   # 选择 data v1.xlsx
+file_path = 'data v1.xlsx'
+raw_data = pd.read_excel(file_path)
+
+print("原始数据形状:", raw_data.shape)
+display(raw_data.head())
+
+# ========== 2. 定义模型和参数网格 ==========
+models = {
+    'Logistic Regression': (
+        LogisticRegression(
+            max_iter=1000,
+            random_state=1,
+            solver='liblinear'
+        ),
+        {
+            'penalty': ['l1', 'l2'],
+            'C': [0.01, 0.1, 1, 10]
+        }
+    ),
+    'Random Forest': (
+        RandomForestClassifier(random_state=1),
+        {
+            'n_estimators': [80, 120, 150],
+            'max_depth': [10, 20, None],
+            'max_features': ['sqrt', 'log2'],
+            'min_samples_leaf': [1, 2]
+        }
+    ),
+    'CatBoost': (
+        CatBoostClassifier(
+            random_state=1,
+            verbose=0,
+            train_dir="catboost_tmp"
+        ),
+        {
+            'learning_rate': [0.03, 0.05],
+            'depth': [4, 5, 6],
+            'iterations': [300, 400],
+            'l2_leaf_reg': [3, 5, 7],
+            'subsample': [0.7, 0.9, 1.0]
+        }
+    ),
+    'Extra Trees': (
+        ExtraTreesClassifier(random_state=1),
+        {
+            'n_estimators': [120, 150],
+            'max_depth': [10, 20, None],
+            'max_features': ['sqrt'],
+            'min_samples_leaf': [1, 2]
+        }
+    )
+}
+
+metric_names = ["Accuracy", "Precision", "Sensitivity",
+                "Specificity", "F1 Score", "AUC-ROC", "AUPRC"]
+
+
+def compute_metrics_from_prob(y_true, y_prob):
+    """
+    根据预测概率，使用 Youden index 找最佳阈值，计算指标
+    """
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    optimal_idx = np.argmax(tpr - fpr)
+    best_thr = thresholds[optimal_idx]
+
+    y_pred = (y_prob >= best_thr).astype(int)
+
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+
+    metrics = {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred),
+        "Sensitivity": recall_score(y_true, y_pred),
+        "Specificity": tn / (tn + fp),
+        "F1 Score": f1_score(y_true, y_pred),
+        "AUC-ROC": roc_auc_score(y_true, y_prob),
+        "AUPRC": average_precision_score(y_true, y_prob),
+    }
+    return metrics, best_thr
+
+
+# =====================================================
+# 3. 主循环：多重插补 (MICE) → subdivision → 模型评估
+# =====================================================
+
+m = 5 # 多重插补/重复实验次数
+
+all_metrics = []   # 用于 pooling（subdivision → MI → final）
+
+# 初始化 all_probs：m 个插补 × 3 个 subdivision × 4 个模型
+model_names = list(models.keys())
+all_probs = [
+    [
+        {model_name: {} for model_name in model_names}
+        for _ in range(3)
+    ]
+    for _ in range(m)
+]
+
+for imp_idx in range(m): # Iterate m times for multiple imputation runs
+    print(f"\n\n==============================")
+    print(f" Processing Imputation Run #{imp_idx+1}/{m} ")
+    print("==============================")
+
+    metrics_this_imp = []
+
+    # Copy raw_data for each imputation run to ensure original NaNs are present
+    data_for_imputation = raw_data.copy()
+    if 'hadm_id' in data_for_imputation.columns:
+        data_for_imputation = data_for_imputation.drop(columns=['hadm_id'])
+
+    # Separate positive and negative classes from the raw data
+    pos = data_for_imputation[data_for_imputation['group'] == 0].sample(frac=1, random_state=2025)  # minority
+    neg = data_for_imputation[data_for_imputation['group'] == 1]                                   # majority
+
+    # Split positive class into 3 parts for subdivision
+    pos_splits = np.array_split(pos, 3)
+
+    for sub_idx, pos_part in enumerate(pos_splits):
+        print(f"\n--- Imputation Run {imp_idx+1}, Subdivision {sub_idx+1}/3 ---")
+
+        df_sub = pd.concat([neg, pos_part], axis=0)
+        df_sub = df_sub.sample(frac=1, random_state=100+sub_idx).reset_index(drop=True)
+
+        X_raw = df_sub.drop(columns=['group']) # X_raw still contains NaNs
+        y = df_sub['group']
+
+        # train/val split (on data with NaNs)
+        X_train_raw, X_val_raw, y_train, y_val = train_test_split(
+            X_raw, y, test_size=0.3, random_state=42, stratify=y
+        )
+
+        # ========== MICE Imputation on train, transform on val ==========
+        imputer = IterativeImputer(random_state=100+imp_idx, max_iter=20) # New imputer for each MI run
+
+        # Ensure we only impute numeric columns in the current split
+        current_numeric_cols = X_train_raw.select_dtypes(include=np.number).columns
+
+        X_train_imputed = X_train_raw.copy()
+        X_val_imputed = X_val_raw.copy()
+
+        # Fit imputer on training data and transform both train and validation
+        X_train_imputed[current_numeric_cols] = imputer.fit_transform(X_train_raw[current_numeric_cols])
+        X_val_imputed[current_numeric_cols] = imputer.transform(X_val_raw[current_numeric_cols])
+
+        # LASSO 特征选择 (using imputed training data)
+        lasso = LassoCV(cv=5, random_state=42).fit(X_train_imputed, y_train)
+        selected_features = X_train_imputed.columns[(lasso.coef_ != 0)]
+
+        if len(selected_features) == 0:
+            print("LASSO 未选出特征 → 使用全部特征")
+            selected_features = X_train_imputed.columns
+
+        X_train_sel = X_train_imputed[selected_features]
+        X_val_sel   = X_val_imputed[selected_features]
+
+        # SMOTE
+        smote = SMOTE(random_state=1)
+        X_train_smote, y_train_smote = smote.fit_resample(X_train_sel, y_train)
+
+        # 标准化
+        scaler = StandardScaler()
+        X_train_smote = scaler.fit_transform(X_train_smote)
+        X_val_scaled = scaler.transform(X_val_sel)
+
+        cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=1, random_state=1)
+
+        metrics_models_this_sub = {}
+
+        # ================= 训练 & 保存 =================
+        for model_name, (model, param_grid) in models.items():
+            print(f"Training {model_name} ...")
+
+            search = RandomizedSearchCV(
+                estimator=model,
+                param_distributions=param_grid,
+                n_iter=10,
+                cv=cv,
+                n_jobs=-1,
+                scoring='roc_auc',
+                random_state=1
+            )
+            search.fit(X_train_smote, y_train_smote)
+
+            # 保存模型对象和特征名称
+            all_probs[imp_idx][sub_idx][model_name]["model_obj"] = search.best_estimator_
+            all_probs[imp_idx][sub_idx][model_name]["feature_names"] = list(selected_features)
+
+            # 预测概率
+            val_pred_prob = search.predict_proba(X_val_scaled)[:, 1]
+
+            # 保存 y_val 和 概率（供 ROC/PR/CM/DCA/Calibration/Fi 等后续使用）
+            all_probs[imp_idx][sub_idx][model_name]["y_val"] = y_val.values
+            all_probs[imp_idx][sub_idx][model_name]["val_pred_prob"] = val_pred_prob
+
+            # 计算指标
+            metrics, best_thr = compute_metrics_from_prob(y_val, val_pred_prob)
+            metrics_models_this_sub[model_name] = metrics
+
+            print(f"  {model_name}: AUC = {metrics['AUC-ROC']:.3f}, "
+                  f"F1 = {metrics['F1 Score']:.3f}")
+
+        metrics_this_imp.append(metrics_models_this_sub)
+
+    all_metrics.append(metrics_this_imp)
+
+print("\n=== ✔ 所有插补 (train/val respecting) + subdivision 模型评估完成，y_val & prob & model 已保存 ===")
+
+
+
+# =====================================================
+# Pooling (Subdivision → MI) + Rubin 95% CI
+# =====================================================
+
+import numpy as np
+import pandas as pd
+
+metric_names = ["Accuracy", "Precision", "Sensitivity",
+                "Specificity", "F1 Score", "AUC-ROC", "AUPRC"]
+
+model_names = list(models.keys())
+
+# -----------------------
+# Subdivision pooling
+# -----------------------
+
+mi_level_values = {model: {metric: [] for metric in metric_names}
+                   for model in model_names}
+
+mi_level_vars = {model: {metric: [] for metric in metric_names}
+                 for model in model_names}
+
+print("\n=== Subdivision pooling... ===\n")
+
+for imp_idx in range(len(all_metrics)):
+    for model_name in model_names:
+        for metric in metric_names:
+
+            # 3 subdivision values
+            values = []
+            for sub_idx in range(len(all_metrics[imp_idx])):
+                values.append(all_metrics[imp_idx][sub_idx][model_name][metric])
+
+            values = np.array(values)
+
+            # mean inside this imputation
+            Q_imp = values.mean()
+            mi_level_values[model_name][metric].append(Q_imp)
+
+            # variance inside this imputation
+            U_imp = values.var(ddof=1)
+            mi_level_vars[model_name][metric].append(U_imp)
+
+
+# -----------------------
+# Rubin’s rules pooling
+# -----------------------
+print("\n=== Rubin Pooling + 95% CI ... ===\n")
+
+rows = []
+
+for model in model_names:
+    for metric in metric_names:
+
+        Q_list = np.array(mi_level_values[model][metric])  # m 个 Q_i
+        U_list = np.array(mi_level_vars[model][metric])    # m 个 U_i
+        m_count = len(Q_list)
+
+        # mean
+        Q_bar = Q_list.mean()
+
+        # within-imputation variance
+        U_bar = U_list.mean()
+
+        # between-imputation variance
+        B = Q_list.var(ddof=1)
+
+        # total variance (Rubin)
+        T = U_bar + (1 + 1/m_count) * B
+        SE = np.sqrt(T)
+
+        CI_low = Q_bar - 1.96 * SE
+        CI_high = Q_bar + 1.96 * SE
+
+        rows.append({
+            "Model": model,
+            "Metric": metric,
+            "Pooled Mean": Q_bar,
+            "Lower 95%CI": CI_low,
+            "Upper 95%CI": CI_high
+        })
+
+pooled_df = pd.DataFrame(rows)
+
+print("=== FINAL POOLED RESULTS (mean + 95% CI) ===")
+display(pooled_df)
+
+pooled_df.to_excel("metrics_pooled_with_95CI.xlsx", index=False)
+print("\n✔ 已保存：metrics_pooled_with_95CI.xlsx")
