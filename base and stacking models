@@ -1,0 +1,416 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, RepeatedStratifiedKFold
+from sklearn.linear_model import LogisticRegression, LassoCV
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from catboost import CatBoostClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, precision_score, recall_score,
+    f1_score, average_precision_score, confusion_matrix, roc_curve
+)
+from imblearn.over_sampling import SMOTE
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+
+from google.colab import files
+uploaded = files.upload()
+
+file_path = 'data v1.xlsx'
+raw_data = pd.read_excel(file_path)
+
+# ========= Overall Train-Test Split (once at the beginning) =========
+# This defines our ultimate training and testing sets, ensuring the test set is held out.
+raw_data_no_hadm = raw_data.drop(columns=['hadm_id'])
+X_raw_full = raw_data_no_hadm.drop(columns=['group'])
+y_raw_full = raw_data_no_hadm['group']
+
+X_train_overall, X_test_overall, y_train_overall, y_test_overall = train_test_split(
+    X_raw_full, y_raw_full, test_size=0.3, stratify=y_raw_full, random_state=42
+)
+numeric_cols = X_raw_full.select_dtypes(include=np.number).columns # Numeric columns for imputation
+
+print("\n===== Initial Data Split Completed =====\n")
+print(f"Overall Training Set Shape (X): {X_train_overall.shape}")
+print(f"Overall Testing Set Shape (X): {X_test_overall.shape}")
+
+# ========= Model Dictionary =========
+models = {
+    'Logistic Regression': (
+        LogisticRegression(max_iter=1000, solver='liblinear'),
+        {
+            'penalty': ['l1', 'l2'],
+            'C': [0.01, 0.1, 1, 10]
+        }
+    ),
+    'Random Forest': (
+        RandomForestClassifier(),
+        {
+            'n_estimators': [80, 120, 150],
+            'max_depth': [10, 20, None],
+            'max_features': ['sqrt', 'log2'],
+            'min_samples_leaf': [1, 2]
+        }
+    ),
+    'CatBoost': (
+        CatBoostClassifier(verbose=0),
+        {
+            'learning_rate': [0.03, 0.05],
+            'depth': [4, 5, 6],
+            'iterations': [300, 400],
+            'l2_leaf_reg': [3, 5, 7],
+            'subsample': [0.7, 0.9, 1.0]
+        }
+    ),
+    'Extra Trees': (
+        ExtraTreesClassifier(),
+        {
+            'n_estimators': [120, 150],
+            'max_depth': [10, 20, None],
+            'max_features': ['sqrt'],
+            'min_samples_leaf': [1, 2]
+        }
+    )
+}
+
+# ========= Metric Function =========
+def compute_metrics(y_true, y_prob, threshold=None):
+    if threshold is None:
+        fpr, tpr, thr = roc_curve(y_true, y_prob)
+        threshold = thr[np.argmax(tpr - fpr)]
+
+    y_pred = (y_prob >= threshold).astype(int)
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+
+    return {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred),
+        "Sensitivity": recall_score(y_true, y_pred),
+        "Specificity": tn / (tn + fp),
+        "F1 Score": f1_score(y_true, y_pred),
+        "AUC-ROC": roc_auc_score(y_true, y_prob),
+        "AUPRC": average_precision_score(y_true, y_prob),
+        "threshold": threshold
+    }
+
+
+# ========= Bootstrap =========
+def bootstrap_ci(y, prob, threshold, n_boot=1000):
+    metrics_boot = {k: [] for k in ["Accuracy","Precision","Sensitivity","Specificity","F1 Score","AUC-ROC","AUPRC"]}
+
+    N = len(y)
+    rng = np.random.default_rng(2025)
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, N, size=N)
+        y_b = y[idx]
+        p_b = prob[idx]
+
+        m = compute_metrics(y_b, p_b, threshold)
+
+        for k in metrics_boot:
+            metrics_boot[k].append(m[k])
+
+    mean_dict = {k: np.mean(metrics_boot[k]) for k in metrics_boot}
+    var_dict  = {k: np.var(metrics_boot[k], ddof=1) for k in metrics_boot}
+
+    return mean_dict, var_dict
+
+
+# ========= Rubin pool containers =========
+rubin_Q = {model: {k: [] for k in ["Accuracy","Precision","Sensitivity","Specificity","F1 Score","AUC-ROC","AUPRC"]} for model in models}
+rubin_U = {model: {k: [] for k in ["Accuracy","Precision","Sensitivity","Specificity","F1 Score","AUC-ROC","AUPRC"]} for model in models}
+
+# ========= 保存 stacking 输入 =========
+all_stack_X = []
+all_stack_y = []
+
+# ========= 保存 ROC/PR/DCA 输入 =========
+roc_pr_data = {m: {"y": [], "prob": []} for m in models.keys()}
+
+# ========= Store trained models and selected features for importance =========
+all_trained_models_info = {model_name: [] for model_name in models.keys()}
+
+m = 5 # Number of imputations
+# ========= MAIN LOOP: per imputation =========
+for imp_i in range(m):
+    print(f"\n===== Processing Imputation #{imp_i+1}/{m} ====")
+
+    # --- Multiple Imputation (fit on training, transform both) ---
+    imputer = IterativeImputer(random_state=123 + imp_i, max_iter=20)
+
+    # Fit imputer ONLY on training numeric data
+    X_train_numeric_imp = imputer.fit_transform(X_train_overall[numeric_cols])
+    # Transform both train and test numeric data using the fitted imputer
+    X_test_numeric_imp = imputer.transform(X_test_overall[numeric_cols])
+
+    # Reconstruct imputed DataFrames for this iteration
+    X_train_imputed_df = X_train_overall.copy()
+    X_train_imputed_df[numeric_cols] = X_train_numeric_imp
+
+    X_test_imputed_df = X_test_overall.copy()
+    X_test_imputed_df[numeric_cols] = X_test_numeric_imp
+
+    # === LASSO Feature Selection (on imputed training data) ===
+    # Scale X_train_imputed_df for LASSO
+    scaler_lasso = StandardScaler()
+    X_train_scaled_lasso = scaler_lasso.fit_transform(X_train_imputed_df)
+
+    # Fit LassoCV on the scaled, imputed training data
+    lasso = LassoCV(cv=5, random_state=50 + imp_i, max_iter=1000).fit(X_train_scaled_lasso, y_train_overall)
+    selected_features = X_train_imputed_df.columns[(lasso.coef_ != 0)]
+    print("Selected features:", selected_features.tolist())
+
+    if len(selected_features) == 0: # Fallback if Lasso selects no features
+        print("  Lasso selected no features. Using all features.")
+        selected_features = X_train_imputed_df.columns
+
+    # Apply selected features to both imputed training and testing sets
+    X_train_sel = X_train_imputed_df[selected_features]
+    X_test_sel = X_test_imputed_df[selected_features]
+
+    # === SMOTE on training data ===
+    smote = SMOTE(random_state=200+imp_i)
+    X_train_sm, y_train_sm = smote.fit_resample(X_train_sel, y_train_overall)
+
+    # For stacking: temporary list per imputation
+    probs_this_imputation = []
+
+    # ========= Train each model =========
+    for model_name, (model, grid) in models.items():
+        print(f"\n--- Training {model_name} ---")
+
+        cv = RepeatedStratifiedKFold(
+            n_splits=5, # k-fold cross-validation on the SMOTEd training data
+            n_repeats=1,
+            random_state=300+imp_i
+        )
+
+        search = RandomizedSearchCV(
+            model,
+            param_distributions=grid,
+            n_iter=15,
+            cv=cv,
+            scoring='roc_auc',
+            random_state=400+imp_i,
+            n_jobs=-1
+        )
+        search.fit(X_train_sm, y_train_sm) # Train on SMOTEd training data
+        best_model = search.best_estimator_
+
+        # Store the best model and selected features for this model and imputation
+        all_trained_models_info[model_name].append({
+            'model': best_model,
+            'features': selected_features.tolist() # Store as list for consistency
+        })
+
+        # === Prediction on the held-out TEST set ===
+        test_prob = best_model.predict_proba(X_test_sel)[:, 1] # Predict on the imputed and feature-selected test set
+        best_thr = compute_metrics(y_test_overall, test_prob)["threshold"] # Calculate optimal threshold from test set
+
+        # ===== 保存给 stacking =====
+        probs_this_imputation.append(test_prob)
+
+        # ===== 保存给 ROC/PR =====
+        roc_pr_data[model_name]["y"].append(y_test_overall.values)
+        roc_pr_data[model_name]["prob"].append(test_prob)
+
+        # ===== Bootstrap per imputation (using test set) =====
+        mean_dict, var_dict = bootstrap_ci(y_test_overall.values, test_prob, best_thr)
+
+        for metric in mean_dict:
+            rubin_Q[model_name][metric].append(mean_dict[metric])
+            rubin_U[model_name][metric].append(var_dict[metric])
+
+    # === END of models: build stacking matrix for this imputation ===
+    stack_matrix = np.vstack(probs_this_imputation).T     # shape (n_test_samples, num_models)
+    all_stack_X.append(stack_matrix)
+    all_stack_y.append(y_test_overall.values)
+
+
+# ========= RUBIN POOLING =========
+rubin_results = {}
+
+for model_name in models:
+    pooled = {}
+
+    for metric in rubin_Q[model_name]:
+        Q_list = np.array(rubin_Q[model_name][metric])
+        U_list = np.array(rubin_U[model_name][metric])
+
+        Qm = np.mean(Q_list)
+        B = np.var(Q_list, ddof=1)
+        W = np.mean(U_list)
+        T = W + (1 + 1/m) * B
+
+        lower = Qm - 1.96 * np.sqrt(T)
+        upper = Qm + 1.96 * np.sqrt(T)
+
+        pooled[metric] = {
+            "mean": Qm,
+            "lower95": lower,
+            "upper95": upper
+        }
+
+    rubin_results[model_name] = pooled
+
+# 导出
+final_df = pd.concat(
+    {model: pd.DataFrame(rubin_results[model]).T for model in rubin_results},
+    axis=0
+)
+
+print("\n\n===== FINAL RUBIN RESULTS =====\n")
+print(final_df)
+
+final_df.to_excel("final_Rubin_pooled_results.xlsx")
+print("\nSaved to final_Rubin_pooled_results.xlsx")
+
+
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, precision_score, recall_score,
+    f1_score, average_precision_score, confusion_matrix, roc_curve
+)
+import numpy as np
+import pandas as pd
+
+
+# ========== 公共指标函数 ==========
+def compute_metrics(y_true, y_prob, threshold):
+    y_pred = (y_prob >= threshold).astype(int)
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+
+    return {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred),
+        "Sensitivity": recall_score(y_true, y_pred),
+        "Specificity": tn / (tn + fp),
+        "F1 Score": f1_score(y_true, y_pred),
+        "AUC-ROC": roc_auc_score(y_true, y_prob),
+        "AUPRC": average_precision_score(y_true, y_prob),
+    }
+
+
+# ========== Gradient Boosting 参数网格 ==========
+gb_param_grid = {
+    "n_estimators": [100, 150, 200],
+    "learning_rate": [0.03, 0.05, 0.1],
+    "max_depth": [2, 3, 4],
+    "subsample": [0.7, 0.8, 1.0],
+    "min_samples_split": [2, 4],
+}
+
+
+# =====================================================
+# 1. 整体 stacking 模型（Gradient Boosting meta-learner）
+# =====================================================
+stack_X_all = np.vstack(all_stack_X)
+stack_y_all = np.hstack(all_stack_y)
+
+print("Stacking input shape (ALL):", stack_X_all.shape)
+
+gb = GradientBoostingClassifier(random_state=1)
+
+search_meta_all = RandomizedSearchCV(
+    estimator=gb,
+    param_distributions=gb_param_grid,
+    n_iter=20,
+    scoring="roc_auc",
+    n_jobs=-1,
+    random_state=1,
+    cv=3
+)
+search_meta_all.fit(stack_X_all, stack_y_all)
+
+meta_all = search_meta_all.best_estimator_
+
+print("\nBest parameters for overall stacking model:\n", search_meta_all.best_params_)
+
+meta_prob_all = meta_all.predict_proba(stack_X_all)[:, 1]
+
+fpr_all, tpr_all, thresholds_all = roc_curve(stack_y_all, meta_prob_all)
+optimal_idx_all = np.argmax(tpr_all - fpr_all)
+best_threshold = thresholds_all[optimal_idx_all]
+
+overall_result = compute_metrics(stack_y_all, meta_prob_all, best_threshold)
+
+print("\n===== STACKING MODEL (Overall Pooled, Gradient Boosting meta) =====")
+for k, v in overall_result.items():
+    print(f"{k}: {v:.4f}")
+
+
+# =====================================================
+# 2. 每个插补的 meta 模型（用于 95% CI）
+# =====================================================
+metric_list_each_imputation = []
+param_list_each_imputation = []
+
+for i, (X_i, y_i) in enumerate(zip(all_stack_X, all_stack_y), start=1):
+    print(f"\nTraining Gradient Boosting meta model on imputation #{i} ...")
+
+    gb_i = GradientBoostingClassifier(random_state=1)
+
+    search_meta_i = RandomizedSearchCV(
+        estimator=gb_i,
+        param_distributions=gb_param_grid,
+        n_iter=20,
+        scoring="roc_auc",
+        n_jobs=-1,
+        random_state=1,
+        cv=3
+    )
+    search_meta_i.fit(X_i, y_i)
+
+    meta_i = search_meta_i.best_estimator_
+    prob_i = meta_i.predict_proba(X_i)[:, 1]
+
+    metrics_i = compute_metrics(y_i, prob_i, best_threshold)
+
+    metric_list_each_imputation.append(metrics_i)
+    param_list_each_imputation.append(search_meta_i.best_params_)
+
+metric_df = pd.DataFrame(metric_list_each_imputation)
+
+print("\n===== EACH IMPUTATION STACKING RESULTS (Gradient Boosting meta) =====")
+print(metric_df)
+
+print("\n===== EACH IMPUTATION BEST PARAMETERS =====")
+display(pd.DataFrame(param_list_each_imputation))
+
+
+# =====================================================
+# 3. Bootstrap 95% CI
+# =====================================================
+n_boot = 1000
+ci_result = {}
+
+for metric in metric_df.columns:
+    vals = metric_df[metric].values
+
+    mean_val = vals.mean()
+
+    boot_means = []
+    for _ in range(n_boot):
+        sample = np.random.choice(vals, size=len(vals), replace=True)
+        boot_means.append(sample.mean())
+
+    lower = np.percentile(boot_means, 2.5)
+    upper = np.percentile(boot_means, 97.5)
+
+    ci_result[metric] = {
+        "mean": mean_val,
+        "lower95": lower,
+        "upper95": upper
+    }
+
+ci_df = pd.DataFrame(ci_result).T
+
+print("\n===== STACKING MODEL (Gradient Boosting meta WITH 95% CI) =====")
+print(ci_df)
+
+ci_df.to_excel("stacking_GB_performance_with_95CI.xlsx")
+print("\nSaved to stacking_GB_performance_with_95CI.xlsx")
